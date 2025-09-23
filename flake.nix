@@ -24,48 +24,74 @@
         rustVersion = "1.83.0";
         rustToolchain = pkgs.rust-bin.stable.${rustVersion}.default;
 
-        # Build the Elixir sidecar first
-        elixirSidecar = pkgs.stdenv.mkDerivation {
-          name = "elixir_sidecar";
+        # Build the Elixir sidecar using proper Mix builders
+        elixirSidecar = let
+          pname = "elixir-sidecar";
+          version = "0.1.0";
           src = ./elixir_sidecar;
 
-          buildInputs = with pkgs; [
-            elixir
-            erlang
-            git
+          mixFodDeps = pkgs.beamPackages.fetchMixDeps {
+            inherit pname version src;
+            sha256 = "sha256-cNJw3zFvLf18+/9tCT5bn4zA+bT7T9x564KukjqmG8U=";
+            mixEnv = "prod";
+          };
+        in
+        pkgs.beamPackages.mixRelease {
+          inherit pname version src mixFodDeps;
+
+          # Add burrito and zig for creating standalone executable
+          nativeBuildInputs = with pkgs; [
             zig_0_14
             xz
             p7zip
+            makeWrapper
           ];
 
+          # Override the build phase to use burrito
           buildPhase = ''
+            runHook preBuild
+
+            export MIX_ENV=prod
             export HOME=$TMPDIR
-            export MIX_HOME=$TMPDIR/.mix
-            export HEX_HOME=$TMPDIR/.hex
 
-            # Install hex and rebar
-            mix local.hex --force
-            mix local.rebar --force
+            # Standard mix compile
+            mix compile --no-deps-check
 
-            # Get dependencies
-            mix deps.get
+            # Build with burrito for standalone executable
+            mix release elixir_sidecar
 
-            # Build release
-            MIX_ENV=prod mix release elixir_sidecar
+            runHook postBuild
           '';
 
           installPhase = ''
+            runHook preInstall
+
             mkdir -p $out/bin
-            # Burrito outputs the executable in burrito_out directory
-            cp burrito_out/elixir_sidecar_* $out/bin/elixir_sidecar
-            chmod +x $out/bin/elixir_sidecar
+
+            # Copy the burrito-generated standalone executable
+            if [ -d burrito_out ]; then
+              cp burrito_out/elixir_sidecar_* $out/bin/elixir_sidecar
+              chmod +x $out/bin/elixir_sidecar
+            else
+              # Fallback to standard release if burrito fails
+              cp -r _build/prod/rel/elixir_sidecar $out/
+              makeWrapper $out/elixir_sidecar/bin/elixir_sidecar $out/bin/elixir_sidecar
+            fi
+
+            runHook postInstall
           '';
+
+          meta = with pkgs.lib; {
+            description = "Elixir sidecar for pg_elixir PostgreSQL extension";
+            platforms = platforms.unix;
+            license = licenses.asl20;
+          };
         };
 
         # Use buildPgrxExtension from nixpkgs
         buildPgrxExtension = pkgs.buildPgrxExtension;
 
-        # Package the pg_elixir extension
+        # Package the pg_elixir extension with embedded sidecar
         pgElixir = buildPgrxExtension {
           pname = "pg_elixir";
           version = "0.1.0";
@@ -82,10 +108,23 @@
 
           buildInputs = [
             postgresql
+            elixirSidecar
           ];
 
           # Skip tests for now due to complexity
           doCheck = false;
+
+          # Include the elixir sidecar in the output
+          postInstall = ''
+            # Create a bin directory in the extension output
+            mkdir -p $out/bin
+            # Copy the elixir sidecar executable
+            cp ${elixirSidecar}/bin/elixir_sidecar $out/bin/
+
+            # Create a configuration file with the sidecar path
+            mkdir -p $out/share
+            echo "${elixirSidecar}/bin/elixir_sidecar" > $out/share/elixir_sidecar_path
+          '';
 
           meta = with pkgs.lib; {
             description = "PostgreSQL extension for running Elixir/BEAM as a background worker sidecar";
@@ -115,7 +154,7 @@
 
           # Extension configuration
           elixir.enabled = true
-          elixir.executable_path = '${elixirSidecar}/bin/elixir_sidecar'
+          elixir.executable_path = '${pgElixir}/bin/elixir_sidecar'
           elixir.socket_path = '$HOME/pg_elixir.sock'
           elixir.request_timeout_ms = 30000
           elixir.max_restarts = 5
@@ -294,7 +333,7 @@
           shellHook = ''
             echo "🚀 Development environment for pg_elixir"
             echo "PostgreSQL with pg_elixir extension: ${postgresqlWithPlugins}/bin"
-            echo "Built-in Elixir sidecar: ${elixirSidecar}/bin/elixir_sidecar"
+            echo "Built-in Elixir sidecar: ${pgElixir}/bin/elixir_sidecar"
             echo ""
             echo "📋 Available commands:"
             echo "  start-postgres      - Initialize and start PostgreSQL with pg_elixir"

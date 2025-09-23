@@ -23,6 +23,7 @@ defmodule ElixirSidecar.MixProject do
     [
       {:jason, "~> 1.4"},
       {:msgpax, "~> 2.3"},
+      {:typed_struct, "~> 0.3", runtime: false},
       {:burrito, "~> 1.0"}
     ]
   end
