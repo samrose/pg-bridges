@@ -1,0 +1,49 @@
+version: '3.8'
+
+services:
+  pg_elixir:
+    build: .
+    container_name: pg_elixir_dev
+    environment:
+      POSTGRES_DB: pg_elixir_test
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./examples:/examples:ro
+    networks:
+      - pg_elixir_network
+
+  # Optional: pgAdmin for database management
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: pg_elixir_pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@pg-elixir.local
+      PGADMIN_DEFAULT_PASSWORD: admin
+      PGADMIN_CONFIG_SERVER_MODE: 'False'
+    ports:
+      - "8080:80"
+    depends_on:
+      - pg_elixir
+    networks:
+      - pg_elixir_network
+
+  # Optional: Redis for caching (if needed for advanced use cases)
+  redis:
+    image: redis:7-alpine
+    container_name: pg_elixir_redis
+    ports:
+      - "6379:6379"
+    networks:
+      - pg_elixir_network
+
+volumes:
+  postgres_data:
+
+networks:
+  pg_elixir_network:
+    driver: bridge
