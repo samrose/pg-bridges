@@ -2,6 +2,7 @@ use pgrx::prelude::*;
 use pgrx::bgworkers::BackgroundWorkerBuilder;
 use uuid::Uuid;
 use once_cell::sync::Lazy;
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
 mod bgworker;
 mod ipc;
@@ -14,6 +15,47 @@ pub use process::*;
 pub use protocol::*;
 
 pgrx::pg_module_magic!();
+
+// Shared memory structure for cross-process communication
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct ElixirSharedState {
+    pub elixir_pid: AtomicI32,           // PID of Elixir process
+    pub is_healthy: AtomicI32,            // 1 = healthy, 0 = unhealthy
+    pub last_ping_time: AtomicU64,        // Unix timestamp of last successful ping
+    pub restart_count: AtomicI32,         // Number of times restarted
+}
+
+impl Default for ElixirSharedState {
+    fn default() -> Self {
+        Self {
+            elixir_pid: AtomicI32::new(0),
+            is_healthy: AtomicI32::new(0),
+            last_ping_time: AtomicU64::new(0),
+            restart_count: AtomicI32::new(0),
+        }
+    }
+}
+
+// Global reference to shared memory
+static mut SHARED_STATE: Option<&'static ElixirSharedState> = None;
+
+// Helper to update shared state
+pub fn update_shared_state<F>(updater: F)
+where
+    F: FnOnce(&ElixirSharedState),
+{
+    unsafe {
+        if let Some(state) = SHARED_STATE {
+            updater(state);
+        }
+    }
+}
+
+// Helper to read shared state
+pub fn get_shared_state() -> Option<&'static ElixirSharedState> {
+    unsafe { SHARED_STATE }
+}
 
 // Shared tokio runtime for all SQL function calls
 static TOKIO_RUNTIME: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
@@ -137,34 +179,31 @@ fn elixir_get_result(request_id: &str) -> String {
 
 #[pg_extern]
 fn elixir_health() -> String {
-    let pm = match get_process_manager() {
-        Some(pm) => pm,
-        None => return format!("{{\"status\": \"not_initialized\"}}"),
-    };
+    unsafe {
+        match SHARED_STATE {
+            Some(state) => {
+                let pid = state.elixir_pid.load(Ordering::Relaxed);
+                let is_healthy = state.is_healthy.load(Ordering::Relaxed) == 1;
+                let last_ping = state.last_ping_time.load(Ordering::Relaxed);
+                let restart_count = state.restart_count.load(Ordering::Relaxed);
 
-    let _ipc = match get_ipc_client() {
-        Some(ipc) => ipc,
-        None => return format!("{{\"status\": \"ipc_not_initialized\"}}"),
-    };
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
 
-    let rt = tokio::runtime::Handle::try_current()
-        .unwrap_or_else(|_| {
-            tokio::runtime::Runtime::new()
-                .expect("Failed to create runtime")
-                .handle()
-                .clone()
-        });
+                let health = serde_json::json!({
+                    "status": if is_healthy { "healthy" } else { "unhealthy" },
+                    "elixir_pid": pid,
+                    "last_ping_seconds_ago": if last_ping > 0 { now - last_ping } else { 0 },
+                    "restart_count": restart_count,
+                });
 
-    let is_running = rt.block_on(pm.is_running());
-    let memory_usage = rt.block_on(pm.get_memory_usage());
-
-    let health = serde_json::json!({
-        "status": if is_running { "healthy" } else { "unhealthy" },
-        "process_running": is_running,
-        "memory_mb": memory_usage.map(|m| m / (1024 * 1024)),
-    });
-
-    serde_json::to_string(&health).unwrap_or_else(|_| "{}".to_string())
+                serde_json::to_string(&health).unwrap_or_else(|_| "{}".to_string())
+            }
+            None => format!("{{\"status\": \"shared_memory_not_initialized\"}}")
+        }
+    }
 }
 
 #[pg_extern]
@@ -227,13 +266,70 @@ fn elixir_load_code(module_name: &str, source_code: &str) -> bool {
 #[allow(non_snake_case)]
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
+    // Allocate shared memory for cross-process state
+    unsafe {
+        use pgrx::pg_sys::*;
+        use std::ffi::CString;
+
+        // Request shared memory on first load
+        static mut SHM_REQUESTED: bool = false;
+        if !SHM_REQUESTED {
+            let size = std::mem::size_of::<ElixirSharedState>();
+            let name = CString::new("pg_elixir_state").unwrap();
+
+            // Request shared memory allocation
+            RequestAddinShmemSpace(size);
+
+            SHM_REQUESTED = true;
+        }
+
+        // Initialize shared memory in postmaster or attach in backends
+        if IsUnderPostmaster {
+            // Backend process - attach to existing shared memory
+            let name = CString::new("pg_elixir_state").unwrap();
+            let found = Box::new(false);
+            let found_ptr = Box::into_raw(found);
+
+            let shmem = ShmemInitStruct(
+                name.as_ptr(),
+                std::mem::size_of::<ElixirSharedState>(),
+                found_ptr
+            );
+
+            if !shmem.is_null() {
+                SHARED_STATE = Some(&*(shmem as *const ElixirSharedState));
+            }
+
+            let _ = Box::from_raw(found_ptr);
+        } else {
+            // Postmaster - initialize shared memory
+            let name = CString::new("pg_elixir_state").unwrap();
+            let found = Box::new(false);
+            let found_ptr = Box::into_raw(found);
+
+            let shmem = ShmemInitStruct(
+                name.as_ptr(),
+                std::mem::size_of::<ElixirSharedState>(),
+                found_ptr
+            );
+
+            if !shmem.is_null() {
+                // Initialize the structure
+                std::ptr::write(shmem as *mut ElixirSharedState, ElixirSharedState::default());
+                SHARED_STATE = Some(&*(shmem as *const ElixirSharedState));
+            }
+
+            let _ = Box::from_raw(found_ptr);
+        }
+    }
+
     BackgroundWorkerBuilder::new("Elixir Background Worker")
         .set_function("elixir_bgworker_main")
         .set_library("pg_elixir")
         .enable_spi_access()
         .load();
 
-    pgrx::log!("pg_elixir loaded - background worker enabled");
+    pgrx::log!("pg_elixir loaded - background worker enabled with shared memory");
 }
 
 #[cfg(test)]

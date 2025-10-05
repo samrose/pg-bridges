@@ -94,7 +94,7 @@
         # Package the pg_elixir extension with embedded sidecar
         pgElixir = buildPgrxExtension {
           pname = "pg_elixir";
-          version = "0.1.1";  # Bumped to pick up new elixirSidecar
+          version = "0.1.2";  # Shared memory implementation
           inherit postgresql;
           cargo-pgrx = supabase-postgres.packages.${system}.cargo-pgrx_0_14_3;
 
