@@ -45,14 +45,15 @@ defmodule ElixirSidecar.FunctionRegistry do
   def handle_call({:call, name, args, timeout}, _from, state) do
     case Map.get(state.functions, name) do
       nil ->
-        register_default_functions()
+        # Register default functions directly in state instead of calling ourselves
+        new_state = register_default_functions_in_state(state)
 
-        case Map.get(state.functions, name) do
+        case Map.get(new_state.functions, name) do
           nil ->
-            {:reply, {:error, "Function not found: #{name}"}, state}
+            {:reply, {:error, "Function not found: #{name}"}, new_state}
 
           fun ->
-            execute_function(fun, args, timeout, state)
+            execute_function(fun, args, timeout, new_state)
         end
 
       fun ->
@@ -97,29 +98,28 @@ defmodule ElixirSidecar.FunctionRegistry do
     %{state | stats: stats}
   end
 
-  defp register_default_functions do
-    register("echo", fn args -> args end)
+  defp register_default_functions_in_state(state) do
+    functions = %{
+      "echo" => fn args -> args end,
+      "add" => fn %{"a" => a, "b" => b} -> a + b end,
+      "multiply" => fn %{"a" => a, "b" => b} -> a * b end,
+      "concat" => fn %{"strings" => strings} when is_list(strings) ->
+        Enum.join(strings, "")
+      end,
+      "uppercase" => fn %{"text" => text} ->
+        String.upcase(text)
+      end,
+      "system_info" => fn _ ->
+        %{
+          "elixir_version" => System.version(),
+          "otp_release" => System.otp_release(),
+          "system_time" => System.system_time(:second),
+          "process_count" => length(Process.list()),
+          "memory" => :erlang.memory()
+        }
+      end
+    }
 
-    register("add", fn %{"a" => a, "b" => b} -> a + b end)
-
-    register("multiply", fn %{"a" => a, "b" => b} -> a * b end)
-
-    register("concat", fn %{"strings" => strings} when is_list(strings) ->
-      Enum.join(strings, "")
-    end)
-
-    register("uppercase", fn %{"text" => text} ->
-      String.upcase(text)
-    end)
-
-    register("system_info", fn _ ->
-      %{
-        "elixir_version" => System.version(),
-        "otp_release" => System.otp_release(),
-        "system_time" => System.system_time(:second),
-        "process_count" => length(Process.list()),
-        "memory" => :erlang.memory()
-      }
-    end)
+    %{state | functions: Map.merge(state.functions, functions)}
   end
 end

@@ -1,7 +1,7 @@
 use crate::protocol::{Request, Response};
 use bytes::{Buf, BufMut, BytesMut};
 use dashmap::DashMap;
-use pgrx::log;
+use pgrx::{log, error};
 use serde_json::Value;
 use std::io;
 use std::path::Path;
@@ -11,7 +11,7 @@ use std::time::Duration;
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::Mutex;
 use tokio::time::{timeout, sleep};
 use uuid::Uuid;
 
@@ -38,7 +38,7 @@ pub enum IpcError {
 
 pub struct IpcClient {
     socket_path: String,
-    stream: Arc<RwLock<Option<UnixStream>>>,
+    stream: Arc<Mutex<Option<UnixStream>>>,
     pending_requests: Arc<DashMap<Uuid, tokio::sync::oneshot::Sender<Result<Response, IpcError>>>>,
     async_results: Arc<DashMap<Uuid, Value>>,
     request_count: Arc<AtomicU64>,
@@ -50,7 +50,7 @@ impl IpcClient {
     pub fn new(socket_path: String) -> Self {
         Self {
             socket_path,
-            stream: Arc::new(RwLock::new(None)),
+            stream: Arc::new(Mutex::new(None)),
             pending_requests: Arc::new(DashMap::new()),
             async_results: Arc::new(DashMap::new()),
             request_count: Arc::new(AtomicU64::new(0)),
@@ -77,7 +77,7 @@ impl IpcClient {
                 }
                 Err(e) if attempt == max_retries - 1 => return Err(e),
                 Err(e) => {
-                    log::error!("Connection attempt {} failed: {}", attempt + 1, e);
+                    error!("Connection attempt {} failed: {}", attempt + 1, e);
                 }
             }
         }
@@ -96,9 +96,8 @@ impl IpcClient {
         }
 
         let stream = UnixStream::connect(&self.socket_path).await?;
-        stream.set_nodelay(true)?;
 
-        let mut stream_lock = self.stream.write().await;
+        let mut stream_lock = self.stream.lock().await;
         *stream_lock = Some(stream);
 
         log!("Connected to Elixir sidecar at {}", self.socket_path);
@@ -109,7 +108,7 @@ impl IpcClient {
     }
 
     pub async fn reconnect(&self) -> Result<(), IpcError> {
-        let mut stream = self.stream.write().await;
+        let mut stream = self.stream.lock().await;
         *stream = None;
         drop(stream);
 
@@ -117,28 +116,35 @@ impl IpcClient {
     }
 
     fn spawn_reader(&self) {
-        let stream_clone = self.stream.clone();
+        let stream_arc = self.stream.clone();
         let pending_requests = self.pending_requests.clone();
         let async_results = self.async_results.clone();
 
         tokio::spawn(async move {
-            loop {
-                let mut buffer = BytesMut::with_capacity(4096);
+            let mut buffer = BytesMut::with_capacity(4096);
 
-                let stream_opt = {
-                    let stream_lock = stream_clone.read().await;
-                    stream_lock.as_ref().map(|s| Ok(s.clone()))
+            loop {
+                let has_stream = {
+                    let stream_lock = stream_arc.lock().await;
+                    stream_lock.is_some()
                 };
 
-                let mut stream = match stream_opt {
-                    Some(Ok(s)) => s,
-                    _ => {
+                if !has_stream {
+                    sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+
+                let read_result = {
+                    let mut stream_lock = stream_arc.lock().await;
+                    if let Some(stream) = stream_lock.as_mut() {
+                        read_message(stream, &mut buffer).await
+                    } else {
                         sleep(Duration::from_millis(100)).await;
                         continue;
                     }
                 };
 
-                match read_message(&mut stream, &mut buffer).await {
+                match read_result {
                     Ok(Some(response)) => {
                         if let Some((_, sender)) = pending_requests.remove(&response.id) {
                             let _ = sender.send(Ok(response.clone()));
@@ -150,8 +156,8 @@ impl IpcClient {
                         sleep(Duration::from_millis(10)).await;
                     }
                     Err(e) => {
-                        log::error!("Error reading from socket: {}", e);
-                        let mut stream_lock = stream_clone.write().await;
+                        log!("Error reading from socket: {}", e);
+                        let mut stream_lock = stream_arc.lock().await;
                         *stream_lock = None;
                         break;
                     }
@@ -183,7 +189,7 @@ impl IpcClient {
             *breaker = Some(
                 std::time::Instant::now() + Duration::from_millis(CIRCUIT_BREAKER_RESET_MS)
             );
-            log::error!("Circuit breaker opened after {} consecutive failures", failures);
+            error!("Circuit breaker opened after {} consecutive failures", failures);
         }
     }
 
@@ -191,9 +197,10 @@ impl IpcClient {
         self.check_circuit_breaker().await?;
 
         let timeout_ms = request.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
+        let request_id = request.id;
         let (tx, rx) = tokio::sync::oneshot::channel();
 
-        self.pending_requests.insert(request.id, tx);
+        self.pending_requests.insert(request_id, tx);
         self.request_count.fetch_add(1, Ordering::SeqCst);
 
         let result = timeout(
@@ -213,7 +220,7 @@ impl IpcClient {
             }
             Err(_) => {
                 self.handle_failure().await;
-                self.pending_requests.remove(&request.id);
+                self.pending_requests.remove(&request_id);
                 Err(IpcError::Timeout)
             }
         }
@@ -224,16 +231,13 @@ impl IpcClient {
         request: Request,
         rx: tokio::sync::oneshot::Receiver<Result<Response, IpcError>>,
     ) -> Result<Response, IpcError> {
-        let stream_opt = {
-            let stream_lock = self.stream.read().await;
-            stream_lock.as_ref().map(|s| s.clone())
-        };
+        {
+            let mut stream_lock = self.stream.lock().await;
+            let stream = stream_lock.as_mut()
+                .ok_or_else(|| IpcError::ConnectionError("Not connected".to_string()))?;
 
-        let mut stream = stream_opt
-            .ok_or_else(|| IpcError::ConnectionError("Not connected".to_string()))?
-;
-
-        write_message(&mut stream, &request).await?;
+            write_message(stream, &request).await?;
+        }
 
         rx.await
             .map_err(|_| IpcError::ConnectionError("Response channel closed".to_string()))?
@@ -243,16 +247,15 @@ impl IpcClient {
         self.check_circuit_breaker().await?;
 
         let request_id = request.id;
-        let stream_opt = {
-            let stream_lock = self.stream.read().await;
-            stream_lock.as_ref().map(|s| s.clone())
-        };
 
-        let mut stream = stream_opt
-            .ok_or_else(|| IpcError::ConnectionError("Not connected".to_string()))?
-;
+        {
+            let mut stream_lock = self.stream.lock().await;
+            let stream = stream_lock.as_mut()
+                .ok_or_else(|| IpcError::ConnectionError("Not connected".to_string()))?;
 
-        write_message(&mut stream, &request).await?;
+            write_message(stream, &request).await?;
+        }
+
         self.request_count.fetch_add(1, Ordering::SeqCst);
 
         Ok(request_id)

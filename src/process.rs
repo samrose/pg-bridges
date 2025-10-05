@@ -1,6 +1,6 @@
 use nix::sys::signal::{self, Signal};
 use nix::unistd::Pid;
-use pgrx::log;
+use pgrx::{log, error};
 use std::collections::VecDeque;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -60,6 +60,7 @@ impl ProcessManager {
         cmd.env("ELIXIR_SOCKET_PATH", &self.socket_path)
             .env("ELIXIR_MEMORY_LIMIT_MB", self.memory_limit_mb.to_string());
 
+        let memory_limit_mb = self.memory_limit_mb;
         unsafe {
             use libc::{rlimit, setrlimit, RLIMIT_AS, RLIMIT_NOFILE};
 
@@ -96,18 +97,23 @@ impl ProcessManager {
             log!("Stopping Elixir process with PID: {}", pid);
 
             if let Err(e) = signal::kill(Pid::from_raw(pid as i32), Signal::SIGTERM) {
-                log::error!("Failed to send SIGTERM: {}", e);
+                error!("Failed to send SIGTERM: {}", e);
             }
 
-            tokio::select! {
-                _ = sleep(Duration::from_secs(5)) => {
-                    log!("Process didn't terminate gracefully, sending SIGKILL");
-                    if let Err(e) = child.kill() {
-                        log::error!("Failed to kill process: {}", e);
-                    }
-                }
-                _ = tokio::task::spawn_blocking(move || child.wait()) => {
+            // Wait for graceful termination or force kill
+            let wait_result = tokio::time::timeout(
+                Duration::from_secs(5),
+                tokio::task::spawn_blocking(move || child.wait())
+            ).await;
+
+            match wait_result {
+                Ok(Ok(Ok(_))) => {
                     log!("Elixir process terminated gracefully");
+                }
+                _ => {
+                    log!("Process didn't terminate gracefully within timeout");
+                    // Process handle moved, can't kill here
+                    let _ = signal::kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
                 }
             }
         }
@@ -160,7 +166,7 @@ impl ProcessManager {
                     false
                 }
                 Err(e) => {
-                    log::error!("Error checking process status: {}", e);
+                    log!("Error checking process status: {}", e);
                     false
                 }
             }
