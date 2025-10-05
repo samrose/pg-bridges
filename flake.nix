@@ -27,12 +27,12 @@
         # Build the Elixir sidecar using proper Mix builders
         elixirSidecar = let
           pname = "elixir-sidecar";
-          version = "0.1.1";  # Bumped to force rebuild
+          version = "0.1.2";  # Bumped to force rebuild
           src = ./elixir_sidecar;
 
           mixFodDeps = pkgs.beamPackages.fetchMixDeps {
             inherit pname version src;
-            sha256 = "sha256-cNJw3zFvLf18+/9tCT5bn4zA+bT7T9x564KukjqmG8U=";  # Will force rebuild
+            sha256 = "sha256-cNJw3zFvLf18+/9tCT5bn4zA+bT7T9x564KukjqmG8U=";
             mixEnv = "prod";
           };
         in
@@ -94,7 +94,7 @@
         # Package the pg_elixir extension with embedded sidecar
         pgElixir = buildPgrxExtension {
           pname = "pg_elixir";
-          version = "0.1.0";
+          version = "0.1.1";  # Bumped to pick up new elixirSidecar
           inherit postgresql;
           cargo-pgrx = supabase-postgres.packages.${system}.cargo-pgrx_0_14_3;
 
@@ -204,6 +204,11 @@
         setupExtensionScript = pkgs.writeShellScriptBin "setup-extension" ''
           SOCKET_DIR=$HOME/pg_sockets
           export PGHOST="$SOCKET_DIR"
+
+          echo "Cleaning up old Elixir processes and cache..."
+          pkill -9 beam.smp 2>/dev/null || true
+          rm -rf "$HOME/Library/Application Support/.burrito/elixir_sidecar"* 2>/dev/null || true
+          sleep 1
 
           echo "Creating test database..."
           ${postgresqlWithPlugins}/bin/createdb pg_elixir_test || echo "Database may already exist"

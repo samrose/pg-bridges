@@ -270,7 +270,7 @@ impl IpcClient {
             id: Uuid::new_v4(),
             function: "ping".to_string(),
             args: Value::Null,
-            timeout_ms: Some(5000),
+            timeout_ms: Some(30000),  // Increased to 30s to handle concurrent requests
         };
 
         self.send_request(request).await?;
