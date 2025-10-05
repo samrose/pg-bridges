@@ -80,8 +80,8 @@ defmodule ElixirSidecar.Server do
   def handle_info({:tcp_closed, socket}, state) do
     client_id = find_client_id(state.clients, socket)
     Logger.info("Client #{client_id} disconnected")
-    new_state = Map.delete(state.clients, client_id)
-    {:noreply, new_state}
+    new_clients = Map.delete(state.clients, client_id)
+    {:noreply, %{state | clients: new_clients}}
   end
 
   @impl true
@@ -99,8 +99,12 @@ defmodule ElixirSidecar.Server do
   @impl true
   def terminate(reason, state) do
     Logger.info("Server terminating: #{inspect(reason)}")
-    :gen_tcp.close(state.listen_socket)
-    File.rm(state.socket_path)
+    if Map.has_key?(state, :listen_socket) do
+      :gen_tcp.close(state.listen_socket)
+    end
+    if Map.has_key?(state, :socket_path) do
+      File.rm(state.socket_path)
+    end
     :ok
   end
 
