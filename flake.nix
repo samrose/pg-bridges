@@ -183,6 +183,11 @@
           EOF
           fi
 
+          echo "Cleaning up old Elixir processes and cache..."
+          pkill -9 beam.smp 2>/dev/null || true
+          rm -rf "$HOME/Library/Application Support/.burrito/elixir_sidecar"* 2>/dev/null || true
+          sleep 1
+
           echo "Starting PostgreSQL..."
           export PGHOST="$SOCKET_DIR"
           ${postgresqlWithPlugins}/bin/pg_ctl -D $PGDATA -l $PGDATA/logfile start
@@ -204,11 +209,6 @@
         setupExtensionScript = pkgs.writeShellScriptBin "setup-extension" ''
           SOCKET_DIR=$HOME/pg_sockets
           export PGHOST="$SOCKET_DIR"
-
-          echo "Cleaning up old Elixir processes and cache..."
-          pkill -9 beam.smp 2>/dev/null || true
-          rm -rf "$HOME/Library/Application Support/.burrito/elixir_sidecar"* 2>/dev/null || true
-          sleep 1
 
           echo "Creating test database..."
           ${postgresqlWithPlugins}/bin/createdb pg_elixir_test || echo "Database may already exist"
