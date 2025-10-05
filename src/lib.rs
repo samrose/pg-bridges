@@ -65,8 +65,8 @@ fn elixir_load_code(_module_name: &str, _source_code: &str) -> bool {
 }
 
 #[allow(non_snake_case)]
-#[pg_extern]
-fn _PG_init() {
+#[pg_guard]
+pub extern "C-unwind" fn _PG_init() {
     BackgroundWorkerBuilder::new("Elixir Background Worker")
         .set_function("elixir_bgworker_main")
         .set_library("pg_elixir")

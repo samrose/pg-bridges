@@ -3,4 +3,3 @@ default_version = '0.1.0'
 module_pathname = '$libdir/pg_elixir'
 relocatable = false
 superuser = true
-schema = pg_elixir

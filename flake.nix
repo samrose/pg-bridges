@@ -114,8 +114,24 @@
           # Skip tests for now due to complexity
           doCheck = false;
 
+          # Generate pgrx schema SQL before install
+          preBuild = ''
+            export PG_CONFIG=${postgresql}/bin/pg_config
+          '';
+
           # Include the elixir sidecar in the output
           postInstall = ''
+            # The pgrx build should have generated the SQL file with function declarations
+            # If it exists, append our custom schema/tables to it
+            if [ -f $out/share/postgresql/extension/pg_elixir--0.1.0.sql ]; then
+              # Append custom SQL to pgrx-generated functions
+              cat ${./pg_elixir--0.1.0.sql} >> $out/share/postgresql/extension/pg_elixir--0.1.0.sql
+            else
+              # If pgrx didn't generate SQL, use ours (though functions won't work)
+              mkdir -p $out/share/postgresql/extension
+              cp ${./pg_elixir--0.1.0.sql} $out/share/postgresql/extension/pg_elixir--0.1.0.sql
+            fi
+
             # Create a bin directory in the extension output
             mkdir -p $out/bin
             # Copy the elixir sidecar executable
@@ -308,8 +324,7 @@
         devShells.default = pkgs.mkShell {
           buildInputs = [
             # PostgreSQL with our extension
-            # postgresqlWithPlugins
-            postgresql
+            postgresqlWithPlugins
 
             # Development tools
             rustToolchain
