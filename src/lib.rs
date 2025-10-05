@@ -262,25 +262,27 @@ fn elixir_load_code(module_name: &str, source_code: &str) -> bool {
     }
 }
 
+// Hook to request shared memory during startup
+#[pg_guard]
+extern "C" fn shmem_request() {
+    unsafe {
+        pgrx::pg_sys::RequestAddinShmemSpace(std::mem::size_of::<ElixirSharedState>());
+    }
+}
+
 #[allow(non_snake_case)]
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
-    // Allocate shared memory for cross-process state
+    // Register shared memory request hook
+    unsafe {
+        pgrx::pg_sys::prev_shmem_request_hook = pgrx::pg_sys::shmem_request_hook;
+        pgrx::pg_sys::shmem_request_hook = Some(shmem_request);
+    }
+
+    // Initialize shared memory
     unsafe {
         use pgrx::pg_sys::*;
         use std::ffi::CString;
-
-        // Request shared memory on first load
-        static mut SHM_REQUESTED: bool = false;
-        if !SHM_REQUESTED {
-            let size = std::mem::size_of::<ElixirSharedState>();
-            let name = CString::new("pg_elixir_state").unwrap();
-
-            // Request shared memory allocation
-            RequestAddinShmemSpace(size);
-
-            SHM_REQUESTED = true;
-        }
 
         // Initialize shared memory in postmaster or attach in backends
         if IsUnderPostmaster {
