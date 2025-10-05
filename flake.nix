@@ -27,12 +27,12 @@
         # Build the Elixir sidecar using proper Mix builders
         elixirSidecar = let
           pname = "elixir-sidecar";
-          version = "0.1.0";
+          version = "0.1.1";  # Bumped to force rebuild
           src = ./elixir_sidecar;
 
           mixFodDeps = pkgs.beamPackages.fetchMixDeps {
             inherit pname version src;
-            sha256 = "sha256-cNJw3zFvLf18+/9tCT5bn4zA+bT7T9x564KukjqmG8U=";
+            sha256 = "sha256-cNJw3zFvLf18+/9tCT5bn4zA+bT7T9x564KukjqmG8U=";  # Will force rebuild
             mixEnv = "prod";
           };
         in

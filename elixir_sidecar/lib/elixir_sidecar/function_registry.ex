@@ -115,7 +115,7 @@ defmodule ElixirSidecar.FunctionRegistry do
           "otp_release" => System.otp_release(),
           "system_time" => System.system_time(:second),
           "process_count" => length(Process.list()),
-          "memory" => :erlang.memory()
+          "memory" => :erlang.memory() |> Enum.into(%{}, fn {k, v} -> {to_string(k), v} end)
         }
       end
     }

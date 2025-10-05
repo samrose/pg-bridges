@@ -1,6 +1,7 @@
 use pgrx::prelude::*;
 use pgrx::bgworkers::BackgroundWorkerBuilder;
 use uuid::Uuid;
+use once_cell::sync::Lazy;
 
 mod bgworker;
 mod ipc;
@@ -13,6 +14,16 @@ pub use process::*;
 pub use protocol::*;
 
 pgrx::pg_module_magic!();
+
+// Shared tokio runtime for all SQL function calls
+static TOKIO_RUNTIME: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .thread_name("pg_elixir_worker")
+        .enable_all()
+        .build()
+        .expect("Failed to create tokio runtime")
+});
 
 // static ELIXIR_STATE: Lazy<Arc<RwLock<Option<ElixirState>>>> = Lazy::new(|| Arc::new(RwLock::new(None)));
 
@@ -50,10 +61,8 @@ fn elixir_call(function_name: &str, args: pgrx::JsonB) -> String {
 
     let request = Request::new(function_name.to_string(), args_value);
 
-    // Create runtime and connect, then send request
-    let rt = tokio::runtime::Runtime::new().expect("Failed to create runtime");
-
-    let result = rt.block_on(async {
+    // Use shared runtime
+    let result = TOKIO_RUNTIME.block_on(async {
         // Connect to socket
         if let Err(e) = ipc_client.connect().await {
             return Err(format!("Connection error: {}", e));
@@ -224,8 +233,7 @@ pub extern "C-unwind" fn _PG_init() {
         .enable_spi_access()
         .load();
 
-    // Note: GUC definitions for pgrx 0.11.x require different syntax
-    // These are placeholder - need to be updated for the specific pgrx version
+    pgrx::log!("pg_elixir loaded - background worker enabled");
 }
 
 #[cfg(test)]

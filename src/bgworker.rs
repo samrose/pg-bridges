@@ -1,14 +1,17 @@
 use pgrx::prelude::*;
 use pgrx::{bgworkers::*, log, error};
+use crate::{ProcessManager, IpcClient, TOKIO_RUNTIME};
 use std::sync::Arc;
 use std::time::Duration;
+use once_cell::sync::Lazy;
+use std::sync::RwLock;
 
-use crate::ipc::IpcClient;
-use crate::process::ProcessManager;
+// Global state accessible to SQL functions
+static PROCESS_MANAGER: Lazy<Arc<RwLock<Option<Arc<ProcessManager>>>>> =
+    Lazy::new(|| Arc::new(RwLock::new(None)));
 
-// Store process manager and IPC client globally
-static mut PROCESS_MANAGER: Option<Arc<ProcessManager>> = None;
-static mut IPC_CLIENT: Option<Arc<IpcClient>> = None;
+static IPC_CLIENT: Lazy<Arc<RwLock<Option<Arc<IpcClient>>>>> =
+    Lazy::new(|| Arc::new(RwLock::new(None)));
 
 #[no_mangle]
 pub extern "C" fn elixir_bgworker_main(_arg: pg_sys::Datum) {
@@ -20,97 +23,113 @@ pub extern "C" fn elixir_bgworker_main(_arg: pg_sys::Datum) {
     let executable_path = get_guc_string("elixir.executable_path")
         .unwrap_or_else(|| "/usr/local/lib/postgresql/elixir_sidecar".to_string());
     let socket_path = get_guc_string("elixir.socket_path")
-        .unwrap_or_else(|| "/tmp/pg_elixir.sock".to_string());
-    let memory_limit_mb = get_guc_int("elixir.memory_limit_mb").unwrap_or(2048) as u64;
-    let max_restarts = get_guc_int("elixir.max_restarts").unwrap_or(5) as usize;
+        .unwrap_or_else(|| {
+            std::env::var("HOME")
+                .map(|h| format!("{}/pg_elixir.sock", h))
+                .unwrap_or_else(|_| "/tmp/pg_elixir.sock".to_string())
+        });
+    let memory_limit_mb = get_guc_int("elixir.memory_limit_mb")
+        .unwrap_or(512) as u64;
+    let max_restarts = get_guc_int("elixir.max_restarts")
+        .unwrap_or(3) as usize;
 
     log!("Elixir executable: {}", executable_path);
     log!("Socket path: {}", socket_path);
+    log!("Memory limit: {} MB", memory_limit_mb);
+    log!("Max restarts: {}", max_restarts);
 
-    // Initialize process manager and IPC client
-    let process_manager = Arc::new(ProcessManager::new(
-        executable_path.clone(),
-        socket_path.clone(),
-        memory_limit_mb,
-        max_restarts,
-    ));
+    // Use the shared TOKIO_RUNTIME instead of creating a new one
+    let result = TOKIO_RUNTIME.block_on(async {
+        // Initialize process manager and IPC client
+        let process_manager = Arc::new(ProcessManager::new(
+            executable_path.clone(),
+            socket_path.clone(),
+            memory_limit_mb,
+            max_restarts,
+        ));
 
-    let ipc_client = Arc::new(IpcClient::new(socket_path.clone()));
+        let ipc_client = Arc::new(IpcClient::new(socket_path.clone()));
 
-    // Store globally for access from SQL functions
-    unsafe {
-        PROCESS_MANAGER = Some(process_manager.clone());
-        IPC_CLIENT = Some(ipc_client.clone());
-    }
-
-    // Start Elixir process in a separate runtime
-    let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
-
-    rt.block_on(async {
-        log!("Starting Elixir sidecar process...");
-
-        if let Err(e) = process_manager.start().await {
-            error!("Failed to start Elixir process: {}", e);
-            return;
+        // Store in global state
+        {
+            let mut pm = PROCESS_MANAGER.write().unwrap();
+            *pm = Some(process_manager.clone());
         }
+        {
+            let mut ipc = IPC_CLIENT.write().unwrap();
+            *ipc = Some(ipc_client.clone());
+        }
+
+        // Start the Elixir process
+        if let Err(e) = process_manager.start().await {
+            log!("Failed to start Elixir process: {}", e);
+            return Err(());
+        }
+
+        log!("Elixir process started successfully");
 
         // Wait for socket to be available
         for i in 0..30 {
             if std::path::Path::new(&socket_path).exists() {
-                log!("Socket available, connecting IPC client...");
+                log!("Socket available at {}", socket_path);
                 break;
             }
             if i == 29 {
-                error!("Socket not available after 30 seconds");
-                return;
+                log!("Socket not available after 30 seconds");
+                let _ = process_manager.stop().await;
+                return Err(());
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
 
         // Connect IPC client
         if let Err(e) = ipc_client.connect().await {
-            error!("Failed to connect IPC client: {}", e);
-            return;
+            log!("Failed to connect IPC client: {}", e);
+            let _ = process_manager.stop().await;
+            return Err(());
         }
 
-        log!("Elixir sidecar connected successfully");
+        log!("Elixir sidecar started and connected successfully");
 
         // Health check loop
-        let mut counter = 0;
         loop {
             tokio::time::sleep(Duration::from_secs(10)).await;
-            counter += 1;
 
-            // Check if process is still running
-            if !process_manager.is_running().await {
-                error!("Elixir process died, attempting restart...");
-                if let Err(e) = process_manager.restart().await {
-                    error!("Failed to restart Elixir process: {}", e);
-                    break;
-                }
-                if let Err(e) = ipc_client.reconnect().await {
-                    error!("Failed to reconnect IPC client: {}", e);
-                    break;
-                }
+            let is_running = process_manager.is_running().await;
+            if !is_running {
+                log!("Elixir process is no longer running");
+                break;
             }
 
-            // Periodic health check
-            if counter % 6 == 0 {
-                if let Err(e) = ipc_client.ping().await {
-                    error!("Health check failed: {}", e);
-                    if let Err(e) = process_manager.restart().await {
-                        error!("Failed to restart after health check failure: {}", e);
-                        break;
-                    }
-                } else {
-                    log!("Health check passed - {} minutes uptime", counter / 6);
+            // Periodic ping to check IPC health
+            if let Err(e) = ipc_client.ping().await {
+                log!("IPC ping failed: {}, attempting reconnect", e);
+                // Try to reconnect
+                if let Err(e) = ipc_client.reconnect().await {
+                    log!("Failed to reconnect IPC: {}, shutting down", e);
+                    break;
                 }
             }
         }
 
         log!("Elixir background worker shutting down");
         let _ = process_manager.stop().await;
+        Ok(())
     });
+
+    if result.is_err() {
+        log!("Background worker exited with error");
+    }
+
+    // Clear global state
+    {
+        let mut pm = PROCESS_MANAGER.write().unwrap();
+        *pm = None;
+    }
+    {
+        let mut ipc = IPC_CLIENT.write().unwrap();
+        *ipc = None;
+    }
 }
 
 // Helper functions to get GUC values
@@ -133,9 +152,9 @@ fn get_guc_int(name: &str) -> Option<i32> {
 
 // Export global accessors for SQL functions
 pub fn get_process_manager() -> Option<Arc<ProcessManager>> {
-    unsafe { PROCESS_MANAGER.clone() }
+    PROCESS_MANAGER.read().unwrap().clone()
 }
 
 pub fn get_ipc_client() -> Option<Arc<IpcClient>> {
-    unsafe { IPC_CLIENT.clone() }
+    IPC_CLIENT.read().unwrap().clone()
 }
