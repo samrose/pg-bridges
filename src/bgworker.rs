@@ -1,5 +1,5 @@
 use pgrx::prelude::*;
-use pgrx::{bgworkers::*, log, error};
+use pgrx::{bgworkers::*, log};
 use crate::{ProcessManager, IpcClient, TOKIO_RUNTIME, update_shared_state};
 use std::sync::Arc;
 use std::time::Duration;
@@ -69,12 +69,11 @@ pub extern "C" fn elixir_bgworker_main(_arg: pg_sys::Datum) {
 
         log!("Elixir process started successfully");
 
-        // Update shared memory with Elixir PID
-        if let Some(child) = process_manager.process.lock().await.as_ref() {
-            update_shared_state(|state| {
-                state.elixir_pid.store(child.id() as i32, Ordering::Relaxed);
-            });
-        }
+        // Update shared memory - PID will be set after we verify the process is running
+        // For now, just mark that we attempted to start
+        update_shared_state(|state| {
+            state.restart_count.fetch_add(1, Ordering::Relaxed);
+        });
 
         // Wait for socket to be available
         for i in 0..30 {

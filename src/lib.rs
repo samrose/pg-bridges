@@ -17,7 +17,6 @@ pub use protocol::*;
 pgrx::pg_module_magic!();
 
 // Shared memory structure for cross-process communication
-#[derive(Copy, Clone)]
 #[repr(C)]
 pub struct ElixirSharedState {
     pub elixir_pid: AtomicI32,           // PID of Elixir process
@@ -26,8 +25,8 @@ pub struct ElixirSharedState {
     pub restart_count: AtomicI32,         // Number of times restarted
 }
 
-impl Default for ElixirSharedState {
-    fn default() -> Self {
+impl ElixirSharedState {
+    pub const fn new() -> Self {
         Self {
             elixir_pid: AtomicI32::new(0),
             is_healthy: AtomicI32::new(0),
@@ -315,7 +314,7 @@ pub extern "C-unwind" fn _PG_init() {
 
             if !shmem.is_null() {
                 // Initialize the structure
-                std::ptr::write(shmem as *mut ElixirSharedState, ElixirSharedState::default());
+                std::ptr::write(shmem as *mut ElixirSharedState, ElixirSharedState::new());
                 SHARED_STATE = Some(&*(shmem as *const ElixirSharedState));
             }
 
