@@ -264,7 +264,7 @@ fn elixir_load_code(module_name: &str, source_code: &str) -> bool {
 
 // Hook to request shared memory during startup
 #[pg_guard]
-extern "C" fn shmem_request() {
+extern "C-unwind" fn pg_elixir_shmem_request() {
     unsafe {
         pgrx::pg_sys::RequestAddinShmemSpace(std::mem::size_of::<ElixirSharedState>());
     }
@@ -275,8 +275,7 @@ extern "C" fn shmem_request() {
 pub extern "C-unwind" fn _PG_init() {
     // Register shared memory request hook
     unsafe {
-        pgrx::pg_sys::prev_shmem_request_hook = pgrx::pg_sys::shmem_request_hook;
-        pgrx::pg_sys::shmem_request_hook = Some(shmem_request);
+        pgrx::pg_sys::shmem_request_hook = Some(pg_elixir_shmem_request);
     }
 
     // Initialize shared memory
