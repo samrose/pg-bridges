@@ -2,7 +2,6 @@ use pgrx::prelude::*;
 use pgrx::bgworkers::BackgroundWorkerBuilder;
 use uuid::Uuid;
 use once_cell::sync::Lazy;
-use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 
 mod bgworker;
 mod ipc;
@@ -15,46 +14,6 @@ pub use process::*;
 pub use protocol::*;
 
 pgrx::pg_module_magic!();
-
-// Shared memory structure for cross-process communication
-#[repr(C)]
-pub struct ElixirSharedState {
-    pub elixir_pid: AtomicI32,           // PID of Elixir process
-    pub is_healthy: AtomicI32,            // 1 = healthy, 0 = unhealthy
-    pub last_ping_time: AtomicU64,        // Unix timestamp of last successful ping
-    pub restart_count: AtomicI32,         // Number of times restarted
-}
-
-impl ElixirSharedState {
-    pub const fn new() -> Self {
-        Self {
-            elixir_pid: AtomicI32::new(0),
-            is_healthy: AtomicI32::new(0),
-            last_ping_time: AtomicU64::new(0),
-            restart_count: AtomicI32::new(0),
-        }
-    }
-}
-
-// Global reference to shared memory
-static mut SHARED_STATE: Option<&'static ElixirSharedState> = None;
-
-// Helper to update shared state
-pub fn update_shared_state<F>(updater: F)
-where
-    F: FnOnce(&ElixirSharedState),
-{
-    unsafe {
-        if let Some(state) = SHARED_STATE {
-            updater(state);
-        }
-    }
-}
-
-// Helper to read shared state
-pub fn get_shared_state() -> Option<&'static ElixirSharedState> {
-    unsafe { SHARED_STATE }
-}
 
 // Shared tokio runtime for all SQL function calls
 static TOKIO_RUNTIME: Lazy<tokio::runtime::Runtime> = Lazy::new(|| {
@@ -178,30 +137,43 @@ fn elixir_get_result(request_id: &str) -> String {
 
 #[pg_extern]
 fn elixir_health() -> String {
-    unsafe {
-        match SHARED_STATE {
-            Some(state) => {
-                let pid = state.elixir_pid.load(Ordering::Relaxed);
-                let is_healthy = state.is_healthy.load(Ordering::Relaxed) == 1;
-                let last_ping = state.last_ping_time.load(Ordering::Relaxed);
-                let restart_count = state.restart_count.load(Ordering::Relaxed);
-
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs();
-
-                let health = serde_json::json!({
-                    "status": if is_healthy { "healthy" } else { "unhealthy" },
-                    "elixir_pid": pid,
-                    "last_ping_seconds_ago": if last_ping > 0 { now - last_ping } else { 0 },
-                    "restart_count": restart_count,
-                });
-
-                serde_json::to_string(&health).unwrap_or_else(|_| "{}".to_string())
-            }
-            None => format!("{{\"status\": \"shared_memory_not_initialized\"}}")
+    // Simple health check - try to call the Elixir sidecar
+    let socket_path = unsafe {
+        let c_name = std::ffi::CString::new("elixir.socket_path").unwrap();
+        let value = pg_sys::GetConfigOption(c_name.as_ptr(), false, false);
+        if value.is_null() {
+            std::env::var("HOME")
+                .map(|h| format!("{}/pg_elixir.sock", h))
+                .unwrap_or_else(|_| "/tmp/pg_elixir.sock".to_string())
+        } else {
+            let c_str = std::ffi::CStr::from_ptr(value);
+            c_str.to_str().unwrap_or("/tmp/pg_elixir.sock").to_string()
         }
+    };
+
+    // Check if socket exists
+    let socket_exists = std::path::Path::new(&socket_path).exists();
+
+    if !socket_exists {
+        return format!("{{\"status\": \"unhealthy\", \"reason\": \"socket_not_found\"}}");
+    }
+
+    // Try to ping the sidecar
+    let ipc_client = std::sync::Arc::new(IpcClient::new(socket_path.clone()));
+    let result = TOKIO_RUNTIME.block_on(async {
+        if let Err(_) = ipc_client.connect().await {
+            return Err("connection_failed");
+        }
+
+        match ipc_client.ping().await {
+            Ok(_) => Ok("healthy"),
+            Err(_) => Err("ping_failed")
+        }
+    });
+
+    match result {
+        Ok(status) => format!("{{\"status\": \"{}\", \"socket_path\": \"{}\"}}", status, socket_path),
+        Err(reason) => format!("{{\"status\": \"unhealthy\", \"reason\": \"{}\", \"socket_path\": \"{}\"}}", reason, socket_path),
     }
 }
 

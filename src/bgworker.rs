@@ -1,9 +1,8 @@
 use pgrx::prelude::*;
 use pgrx::{bgworkers::*, log};
-use crate::{ProcessManager, IpcClient, TOKIO_RUNTIME, update_shared_state};
+use crate::{ProcessManager, IpcClient, TOKIO_RUNTIME};
 use std::sync::Arc;
 use std::time::Duration;
-use std::sync::atomic::Ordering;
 use once_cell::sync::Lazy;
 use std::sync::RwLock;
 
@@ -69,12 +68,6 @@ pub extern "C" fn elixir_bgworker_main(_arg: pg_sys::Datum) {
 
         log!("Elixir process started successfully");
 
-        // Update shared memory - PID will be set after we verify the process is running
-        // For now, just mark that we attempted to start
-        update_shared_state(|state| {
-            state.restart_count.fetch_add(1, Ordering::Relaxed);
-        });
-
         // Wait for socket to be available
         for i in 0..30 {
             if std::path::Path::new(&socket_path).exists() {
@@ -98,16 +91,6 @@ pub extern "C" fn elixir_bgworker_main(_arg: pg_sys::Datum) {
 
         log!("Elixir sidecar started and connected successfully");
 
-        // Mark as healthy in shared memory
-        update_shared_state(|state| {
-            state.is_healthy.store(1, Ordering::Relaxed);
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs();
-            state.last_ping_time.store(now, Ordering::Relaxed);
-        });
-
         // Health check loop
         loop {
             tokio::time::sleep(Duration::from_secs(10)).await;
@@ -115,30 +98,16 @@ pub extern "C" fn elixir_bgworker_main(_arg: pg_sys::Datum) {
             let is_running = process_manager.is_running().await;
             if !is_running {
                 log!("Elixir process is no longer running");
-                update_shared_state(|state| {
-                    state.is_healthy.store(0, Ordering::Relaxed);
-                });
                 break;
             }
 
             // Periodic ping to check IPC health
             match ipc_client.ping().await {
                 Ok(_) => {
-                    // Update last successful ping time
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap()
-                        .as_secs();
-                    update_shared_state(|state| {
-                        state.is_healthy.store(1, Ordering::Relaxed);
-                        state.last_ping_time.store(now, Ordering::Relaxed);
-                    });
+                    // Ping successful
                 }
                 Err(e) => {
                     log!("IPC ping failed: {}, attempting reconnect", e);
-                    update_shared_state(|state| {
-                        state.is_healthy.store(0, Ordering::Relaxed);
-                    });
                     // Try to reconnect
                     if let Err(e) = ipc_client.reconnect().await {
                         log!("Failed to reconnect IPC: {}, shutting down", e);
