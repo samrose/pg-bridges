@@ -202,6 +202,11 @@
 
           echo "Stopping PostgreSQL..."
           ${postgresqlWithPlugins}/bin/pg_ctl -D $PGDATA stop
+
+          echo "Cleaning up Elixir processes and cache..."
+          pkill -9 beam.smp 2>/dev/null || true
+          rm -rf "$HOME/Library/Application Support/.burrito/elixir_sidecar"* 2>/dev/null || true
+
           echo "PostgreSQL stopped."
         '';
 
