@@ -302,16 +302,16 @@ async fn read_message(
     stream: &mut UnixStream,
     buffer: &mut BytesMut,
 ) -> Result<Option<Response>, IpcError> {
-    if buffer.len() < 4 {
-        let mut len_buf = [0u8; 4];
-        match stream.read_exact(&mut len_buf).await {
-            Ok(_) => buffer.put_slice(&len_buf),
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-            Err(e) => return Err(e.into()),
-        }
+    // Always read fresh length prefix (don't use buffer for length)
+    let mut len_buf = [0u8; 4];
+    match stream.read_exact(&mut len_buf).await {
+        Ok(_) => {},
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+        Err(e) => return Err(e.into()),
     }
 
-    let len = buffer.get_u32() as usize;
+    let len = u32::from_be_bytes(len_buf) as usize;
 
     if len > MAX_MESSAGE_SIZE {
         return Err(IpcError::ProtocolError("Message too large".to_string()));
