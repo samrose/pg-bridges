@@ -262,74 +262,16 @@ fn elixir_load_code(module_name: &str, source_code: &str) -> bool {
     }
 }
 
-// Hook to request shared memory during startup
-#[pg_guard]
-extern "C-unwind" fn pg_elixir_shmem_request() {
-    unsafe {
-        pgrx::pg_sys::RequestAddinShmemSpace(std::mem::size_of::<ElixirSharedState>());
-    }
-}
-
 #[allow(non_snake_case)]
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
-    // Register shared memory request hook
-    unsafe {
-        pgrx::pg_sys::shmem_request_hook = Some(pg_elixir_shmem_request);
-    }
-
-    // Initialize shared memory
-    unsafe {
-        use pgrx::pg_sys::*;
-        use std::ffi::CString;
-
-        // Initialize shared memory in postmaster or attach in backends
-        if IsUnderPostmaster {
-            // Backend process - attach to existing shared memory
-            let name = CString::new("pg_elixir_state").unwrap();
-            let found = Box::new(false);
-            let found_ptr = Box::into_raw(found);
-
-            let shmem = ShmemInitStruct(
-                name.as_ptr(),
-                std::mem::size_of::<ElixirSharedState>(),
-                found_ptr
-            );
-
-            if !shmem.is_null() {
-                SHARED_STATE = Some(&*(shmem as *const ElixirSharedState));
-            }
-
-            let _ = Box::from_raw(found_ptr);
-        } else {
-            // Postmaster - initialize shared memory
-            let name = CString::new("pg_elixir_state").unwrap();
-            let found = Box::new(false);
-            let found_ptr = Box::into_raw(found);
-
-            let shmem = ShmemInitStruct(
-                name.as_ptr(),
-                std::mem::size_of::<ElixirSharedState>(),
-                found_ptr
-            );
-
-            if !shmem.is_null() {
-                // Initialize the structure
-                std::ptr::write(shmem as *mut ElixirSharedState, ElixirSharedState::new());
-                SHARED_STATE = Some(&*(shmem as *const ElixirSharedState));
-            }
-
-            let _ = Box::from_raw(found_ptr);
-        }
-    }
-
     BackgroundWorkerBuilder::new("Elixir Background Worker")
         .set_function("elixir_bgworker_main")
         .set_library("pg_elixir")
         .enable_spi_access()
         .load();
 
-    pgrx::log!("pg_elixir loaded - background worker enabled with shared memory");
+    pgrx::log!("pg_elixir loaded - background worker enabled");
 }
 
 #[cfg(test)]
