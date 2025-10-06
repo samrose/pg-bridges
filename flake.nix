@@ -27,7 +27,7 @@
         # Build the Elixir sidecar using proper Mix builders
         elixirSidecar = let
           pname = "elixir-sidecar";
-          version = "0.1.2";  # Bumped to force rebuild
+          version = "0.1.3";  # Manual acceptor pool implementation (10 acceptors)
           src = ./elixir_sidecar;
 
           mixFodDeps = pkgs.beamPackages.fetchMixDeps {
@@ -94,7 +94,7 @@
         # Package the pg_elixir extension with embedded sidecar
         pgElixir = buildPgrxExtension {
           pname = "pg_elixir";
-          version = "0.1.2";  # Shared memory implementation
+          version = "0.1.3";  # Manual acceptor pool (10 acceptors)
           inherit postgresql;
           cargo-pgrx = supabase-postgres.packages.${system}.cargo-pgrx_0_14_3;
 

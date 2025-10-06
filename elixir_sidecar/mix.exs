@@ -4,7 +4,7 @@ defmodule ElixirSidecar.MixProject do
   def project do
     [
       app: :elixir_sidecar,
-      version: "0.1.0",
+      version: "0.1.3",
       elixir: "~> 1.14",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
@@ -51,7 +51,7 @@ defmodule ElixirSidecar.MixProject do
           extra_steps: [
             wrap: [
               extra_args: [
-                "--app-version", "0.1.0"
+                "--app-version", "0.1.3"
               ]
             ]
           ]

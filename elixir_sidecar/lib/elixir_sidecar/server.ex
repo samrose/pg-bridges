@@ -3,7 +3,7 @@ defmodule ElixirSidecar.Server do
   require Logger
 
   @read_timeout 30_000
-  @max_message_size 16 * 1024 * 1024
+  @num_acceptors 10
 
   def start_link(opts) do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
@@ -19,8 +19,13 @@ defmodule ElixirSidecar.Server do
 
     case :gen_tcp.listen(0, [:binary, packet: 4, active: false, ip: {:local, socket_path}]) do
       {:ok, listen_socket} ->
-        Logger.info("ElixirSidecar listening on #{socket_path}")
-        send(self(), :accept)
+        Logger.info("ElixirSidecar listening on #{socket_path} with #{@num_acceptors} acceptors")
+
+        # Start multiple acceptor processes for concurrent connection handling
+        for _ <- 1..@num_acceptors do
+          spawn_acceptor(listen_socket)
+        end
+
         {:ok, %{listen_socket: listen_socket, socket_path: socket_path, clients: %{}}}
 
       {:error, reason} ->
@@ -29,56 +34,86 @@ defmodule ElixirSidecar.Server do
     end
   end
 
-  @impl true
-  def handle_info(:accept, state) do
-    case :gen_tcp.accept(state.listen_socket, 100) do
+  defp spawn_acceptor(listen_socket) do
+    server_pid = self()
+
+    spawn_link(fn ->
+      acceptor_loop(listen_socket, server_pid)
+    end)
+  end
+
+  defp acceptor_loop(listen_socket, server_pid) do
+    case :gen_tcp.accept(listen_socket) do
       {:ok, client_socket} ->
-        :inet.setopts(client_socket, active: :once)
+        # Register client with the server
         client_id = :erlang.unique_integer([:positive])
+        send(server_pid, {:client_connected, client_id, client_socket})
 
-        new_state = put_in(state.clients[client_id], %{
-          socket: client_socket,
-          connected_at: System.system_time(:second)
-        })
+        # Handle this client in a separate process
+        spawn_link(fn ->
+          handle_client(client_socket, client_id, server_pid)
+        end)
 
-        Logger.info("Client #{client_id} connected")
-        send(self(), :accept)
-        {:noreply, new_state}
-
-      {:error, :timeout} ->
-        send(self(), :accept)
-        {:noreply, state}
+        # Continue accepting more connections
+        acceptor_loop(listen_socket, server_pid)
 
       {:error, reason} ->
         Logger.error("Accept error: #{inspect(reason)}")
-        send(self(), :accept)
-        {:noreply, state}
+        # Restart acceptor on error
+        Process.sleep(100)
+        acceptor_loop(listen_socket, server_pid)
     end
   end
 
-  @impl true
-  def handle_info({:tcp, socket, data}, state) do
-    client_id = find_client_id(state.clients, socket)
-
-    case Jason.decode(data) do
-      {:ok, %{"id" => id, "function" => function, "args" => args} = request} ->
-        timeout = Map.get(request, "timeout_ms", @read_timeout)
-        Task.Supervisor.start_child(ElixirSidecar.TaskSupervisor, fn ->
-          response = handle_request(function, args, timeout)
-          send_response(socket, id, response)
-        end)
-
-      {:error, reason} ->
-        Logger.error("Failed to decode request: #{inspect(reason)}")
-    end
-
+  defp handle_client(socket, client_id, server_pid) do
     :inet.setopts(socket, active: :once)
-    {:noreply, state}
+    client_loop(socket, client_id, server_pid)
+  end
+
+  defp client_loop(socket, client_id, server_pid) do
+    receive do
+      {:tcp, ^socket, data} ->
+        case Jason.decode(data) do
+          {:ok, %{"id" => id, "function" => function, "args" => args} = request} ->
+            timeout = Map.get(request, "timeout_ms", @read_timeout)
+
+            # Process request asynchronously
+            Task.Supervisor.start_child(ElixirSidecar.TaskSupervisor, fn ->
+              response = handle_request(function, args, timeout)
+              send_response(socket, id, response)
+            end)
+
+          {:error, reason} ->
+            Logger.error("Failed to decode request: #{inspect(reason)}")
+        end
+
+        :inet.setopts(socket, active: :once)
+        client_loop(socket, client_id, server_pid)
+
+      {:tcp_closed, ^socket} ->
+        send(server_pid, {:client_disconnected, client_id, socket})
+        :ok
+
+      {:tcp_error, ^socket, reason} ->
+        Logger.error("Client #{client_id} socket error: #{inspect(reason)}")
+        send(server_pid, {:client_disconnected, client_id, socket})
+        :ok
+    end
   end
 
   @impl true
-  def handle_info({:tcp_closed, socket}, state) do
-    client_id = find_client_id(state.clients, socket)
+  def handle_info({:client_connected, client_id, socket}, state) do
+    new_state = put_in(state.clients[client_id], %{
+      socket: socket,
+      connected_at: System.system_time(:second)
+    })
+
+    Logger.info("Client #{client_id} connected")
+    {:noreply, new_state}
+  end
+
+  @impl true
+  def handle_info({:client_disconnected, client_id, _socket}, state) do
     Logger.info("Client #{client_id} disconnected")
     new_clients = Map.delete(state.clients, client_id)
     {:noreply, %{state | clients: new_clients}}
@@ -106,12 +141,6 @@ defmodule ElixirSidecar.Server do
       File.rm(state.socket_path)
     end
     :ok
-  end
-
-  defp find_client_id(clients, socket) do
-    Enum.find_value(clients, fn {id, %{socket: s}} ->
-      if s == socket, do: id
-    end)
   end
 
   defp handle_request("ping", _args, _timeout) do
